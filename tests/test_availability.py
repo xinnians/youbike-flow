@@ -54,11 +54,20 @@ def data_dir(tmp_path):
     return tmp_path
 
 
-def test_probabilities(data_dir):
+def _load(data_dir):
     con = duckdb.connect()
     load_calendar(con, sorted((ROOT / "data").glob("calendar_*.csv")))
-    assert availability.load_snapshots(con, data_dir, [A, B]) == 18
-    rows = {(r["sno"], r["day_type"], r["slot"]): r for r in availability.compute(con, {A: "甲", B: "乙"})}
+    n = availability.load_snapshots(con, data_dir)
+    return con, n
+
+
+def test_probabilities_cover_all_stations(data_dir):
+    con, n = _load(data_dir)
+    assert n == 9 * 1202                                        # 9 次抓取 × 全部站點
+    names = availability.load_station_names(con, data_dir)
+    assert names[A] == A and len(names) == 1202                 # 合併檔與當天小檔的站名都讀到
+    rows = {(r["sno"], r["day_type"], r["slot"]): r for r in availability.compute(con, names)}
+    assert {k[0] for k in rows} >= {A, B, "500900000"}          # 不只常用站
 
     r = rows[(A, "平日", "17:00")]
     assert (r["n_days"], r["n_snapshots"]) == (2, 6)
@@ -74,14 +83,19 @@ def test_probabilities(data_dir):
 
     r = rows[(A, "假日", "17:00")]                             # 10/3（六）有車、9/28 教師節無車
     assert (r["n_days"], r["p_no_bike"]) == (2, 0.5)
-    assert availability.summary(con)["excluded_stale_or_inactive"] == 2
+    s = availability.summary(con)
+    assert s["excluded_stale_or_inactive"] == 2 and s["stations"] == 1202
 
 
-def test_render_html_embeds_data(data_dir):
-    con = duckdb.connect()
-    load_calendar(con, sorted((ROOT / "data").glob("calendar_*.csv")))
-    availability.load_snapshots(con, data_dir, [A])
-    rows = availability.compute(con, {A: "瑞光路316巷</script>"})
-    html = availability.render_html(rows, {A: "瑞光路316巷</script>"}, availability.summary(con))
+def test_pack_and_render(data_dir):
+    con, _ = _load(data_dir)
+    names = {**availability.load_station_names(con, data_dir), A: "瑞光路316巷</script>"}
+    rows = availability.compute(con, names)
+    packed = availability.pack(rows, names)
+    nb, nd, days, snaps = packed[A][1]["平日"]
+    i17 = availability.SLOTS.index("17:00")
+    assert (nb[i17], nd[i17], days[i17], snaps[i17]) == (667, 0, 2, 6)
+    assert nb[availability.SLOTS.index("03:00")] is None      # 沒資料的時段是 null
+    html = availability.render_html(rows, names, {A: "瑞光路316巷"}, availability.summary(con))
     assert "/*__DATA__*/" not in html
     assert "瑞光路316巷<\\/script>" in html and html.count("</script>") == 1

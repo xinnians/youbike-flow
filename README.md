@@ -1,6 +1,8 @@
 # youbike-flow
 
-臺北市 YouBike 2.0 常用站的流向分析與無車預估（自用驗證版）。
+臺北市 YouBike 2.0 站點流向分析與無車預估（自用驗證版）。
+
+**原則：收集、分析一律涵蓋全站；常用站只是目前想特別看的焦點**（2026-09-29 確認）。
 
 要驗證的假設：「如果事先知道常用站何時可能沒車、車都流去哪，我會改變出門時間或選站。」
 
@@ -18,14 +20,14 @@ flows/       租借紀錄流向分析（本機跑）
   build_trips.py   zip → raw/trips/<年月>.parquet（容錯：編碼、欄位名、時間格式）
   stations.py      站點參照表（臺北市＋新北市即時 API）與站名比對
   analyze.py       前 5 名去向／來源、每小時淨流量（平日／假日）
-predict/     常用站無車／無位機率（第 2 週）
-  availability.py           data 分支快照 → 每站 × 平日/假日 × 15 分鐘的機率 CSV 與圖表頁
+predict/     全站無車／無位機率（第 2 週）
+  availability.py           data 分支快照 → 全站 × 平日/假日 × 15 分鐘的機率 CSV 與圖表頁
 tdx/         TDX 歷史車位 API 小探測（有用量護欄）
   probe.py
 data/        小型參考資料（進 git）
   calendar_115.csv       人事行政總處 115 年（2026）辦公日曆表
   station_aliases.csv    改名站點對照（附證據）
-  my_stations.csv        常用站清單（機率圖只算這些站）
+  my_stations.csv        常用站清單（圖表頁預設顯示的站）
 raw/, out/   下載檔與分析輸出（不進 git，可用指令重建）
 ```
 
@@ -113,15 +115,15 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | TDX 歷史車位 | `/api/historical/v2/Historical/Bike/Availability/{City}?Dates=`，一次最多 7 天，最早 2021-06-01（依據第三方 R 套件 `ChiaJung-Yeh/NYCU_TDX` 的原始碼）；**粒度與最新可查日期未驗證，要先申請帳號** |
 | 新北即時 API | `data.ntpc.gov.tw` 資料集 `010e5b15-…`，1,610 站，用來補還到新北的站點座標 |
 
-## 常用站無車／無位機率
+## 無車／無位機率
 
 ```bash
 git clone --branch data --single-branch https://github.com/xinnians/youbike-flow.git ~/youbike-data   # 之後用 git -C ~/youbike-data pull 更新
 .venv/bin/python -m predict.availability --data-dir ~/youbike-data
 ```
 
-- 常用站在 `data/my_stations.csv`：目前是 `瑞光路316巷`（500108171）、`大港墘公園(洲子街)`（500108153）
-- 輸出 `out/availability_15min.csv` 與 `out/availability.html`（每站平日／假日兩張圖，滑鼠移上去看數值與樣本數，樣本少於 3 天的時段淡色顯示）
+- 全站都算：`out/availability_15min.csv` 含所有站點
+- `out/availability.html`：預設顯示 `data/my_stations.csv` 的常用站（目前 `瑞光路316巷`、`大港墘公園(洲子街)`），搜尋框可用站名或站號叫出任何一站；每站平日／假日兩張圖，滑鼠移上去看數值與樣本數，樣本少於 3 天的時段淡色顯示。檔案約 3–6MB
 - `p_no_bike`／`p_no_dock`：該時段所有快照中遇到 0 台／0 格的比例；`*_any`：該時段任一次快照為 0 的天數比例（較保守）
 - 排除停用站（`act ≠ 1`）與資料時間落後超過 30 分鐘的快照
 - **不回補歷史資料**（2026-09-29 決定），只用收集器從 2026-09-29 起的資料，樣本要累積到約 10/20 才夠

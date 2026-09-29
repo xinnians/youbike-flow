@@ -3,7 +3,7 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>常用站無車機率</title>
+<title>無車機率</title>
 <style>
 :root {
   color-scheme: light;
@@ -63,17 +63,31 @@ table { border-collapse: collapse; font-size: 12px; margin-top: 8px; font-varian
 th, td { padding: 2px 10px; text-align: right; border-bottom: 1px solid var(--grid); }
 th:first-child, td:first-child { text-align: left; }
 .note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
+.search { display: flex; gap: 8px; align-items: center; margin: 0 0 16px; flex-wrap: wrap; }
+.search input { font: inherit; padding: 6px 10px; border: 1px solid var(--axis); border-radius: 6px;
+                background: var(--surface-1); color: var(--text-primary); width: min(360px, 100%); }
+.search .hint { color: var(--text-muted); font-size: 12px; }
+.station header { display: flex; justify-content: space-between; align-items: baseline; gap: 8px; }
+.station header button { font: inherit; font-size: 12px; color: var(--text-secondary); background: none;
+                         border: 1px solid var(--border); border-radius: 6px; padding: 2px 8px; cursor: pointer; }
+.tag { font-size: 12px; color: var(--text-muted); font-weight: 400; margin-left: 6px; }
 </style>
 </head>
 <body>
 <main>
-  <h1>常用站無車／無位機率</h1>
+  <h1>YouBike 無車／無位機率</h1>
   <p class="meta" id="meta"></p>
   <div class="legend">
     <span class="key"><i style="background:var(--series-1)"></i>無車（可借 0 台）</span>
     <span class="key"><i style="background:var(--series-2)"></i>無位（可還 0 格）</span>
     <span class="key" id="lowkey"></span>
   </div>
+  <div class="search">
+    <input id="q" list="station-list" placeholder="搜尋站名或站號，例如 捷運港墘站" autocomplete="off" aria-label="搜尋站點">
+    <datalist id="station-list"></datalist>
+    <span class="hint" id="hint"></span>
+  </div>
+  <div id="picked"></div>
   <div id="stations"></div>
   <p class="note">機率＝該 15 分鐘時段內，所有快照中遇到 0 台（或 0 格）的比例。已排除停用站點，以及資料時間落後超過 30 分鐘的快照。平日／假日依人事行政總處辦公日曆表。</p>
 </main>
@@ -96,6 +110,17 @@ function el(tag, attrs = {}, parent) {
   for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
   if (parent) parent.appendChild(e);
   return e;
+}
+
+// arrs = [無車‰[96], 無位‰[96], 天數[96], 快照數[96]]；轉回以時段為鍵的列
+function toRows(arrs) {
+  if (!arrs) return [];
+  const rows = [];
+  for (let i = 0; i < 96; i++) {
+    if (arrs[2][i] == null) continue;
+    rows.push({ slot: SLOTS[i], p_no_bike: arrs[0][i] / 1000, p_no_dock: arrs[1][i] / 1000, n_days: arrs[2][i], n_snapshots: arrs[3][i] });
+  }
+  return rows;
 }
 
 function renderPanel(container, rows, minDays) {
@@ -174,7 +199,9 @@ function renderPanel(container, rows, minDays) {
   container.append(svg, tip);
 }
 
-function renderTable(parent, rows) {
+function renderTable(parent, byType) {
+  const rows = [];
+  for (const dt of ["平日", "假日"]) for (const r of byType[dt]) rows.push({ day_type: dt, ...r });
   const d = document.createElement("details");
   const s = document.createElement("summary"); s.textContent = "表格檢視"; d.appendChild(s);
   const t = document.createElement("table");
@@ -196,28 +223,60 @@ function renderTable(parent, rows) {
 const m = DATA.meta;
 document.getElementById("meta").textContent =
   `資料期間 ${m.period || "—"}；平日 ${m.days["平日"] || 0} 天、假日 ${m.days["假日"] || 0} 天；` +
-  `${m.snapshots} 筆快照（排除 ${m.excluded_stale_or_inactive} 筆）；產生於 ${m.generated}`;
+  `${m.stations} 站、${m.snapshots} 筆快照（排除 ${m.excluded_stale_or_inactive} 筆）；產生於 ${m.generated}`;
 const lowkey = document.getElementById("lowkey");
 const lk = document.createElement("i"); lk.style.cssText = "background:var(--text-muted);opacity:.3";
 lowkey.append(lk, document.createTextNode(`淡色＝樣本少於 ${m.min_days} 天`));
 
-const root = document.getElementById("stations");
-for (const st of DATA.stations) {
-  const sec = document.createElement("section"); sec.className = "station";
-  const h = document.createElement("h2"); h.textContent = `${st.name}（${st.sno}）`; sec.appendChild(h);
+function renderStation(sno, { tag, removable } = {}) {
+  const entry = DATA.stations[sno];
+  const name = entry ? entry[0] : (DATA.featured_names[sno] || sno);
+  const sec = document.createElement("section"); sec.className = "station"; sec.dataset.sno = sno;
+  const header = document.createElement("header");
+  const h = document.createElement("h2"); h.textContent = `${name}（${sno}）`;
+  if (tag) { const t = document.createElement("span"); t.className = "tag"; t.textContent = tag; h.appendChild(t); }
+  header.appendChild(h);
+  if (removable) {
+    const b = document.createElement("button"); b.type = "button"; b.textContent = "移除";
+    b.addEventListener("click", () => sec.remove()); header.appendChild(b);
+  }
+  sec.appendChild(header);
   const panels = document.createElement("div"); panels.className = "panels";
-  const mine = DATA.rows.filter(r => r.sno === st.sno);
+  const byType = {};
   for (const dt of ["平日", "假日"]) {
+    byType[dt] = toRows(entry && entry[1][dt]);
     const p = document.createElement("div"); p.className = "panel";
     const h3 = document.createElement("h3"); h3.textContent = dt; p.appendChild(h3);
     const plot = document.createElement("div"); plot.className = "plot"; p.appendChild(plot);
     panels.appendChild(p);
-    renderPanel(plot, mine.filter(r => r.day_type === dt), m.min_days);
+    renderPanel(plot, byType[dt], m.min_days);
   }
   sec.appendChild(panels);
-  renderTable(sec, mine);
-  root.appendChild(sec);
+  renderTable(sec, byType);
+  return sec;
 }
+
+const root = document.getElementById("stations");
+for (const sno of DATA.featured) root.appendChild(renderStation(sno, { tag: "常用站" }));
+
+// 搜尋：選到站就把它的圖加到常用站上方
+const list = document.getElementById("station-list"), q = document.getElementById("q"), hint = document.getElementById("hint");
+const labelToSno = new Map();
+for (const [sno, [name]] of Object.entries(DATA.stations).sort((a, b) => a[1][0].localeCompare(b[1][0], "zh-Hant"))) {
+  const label = `${name}（${sno}）`; labelToSno.set(label, sno);
+  const o = document.createElement("option"); o.value = label; list.appendChild(o);
+}
+hint.textContent = `共 ${labelToSno.size} 站可查`;
+const picked = document.getElementById("picked");
+function pick() {
+  const sno = labelToSno.get(q.value.trim()) || (DATA.stations[q.value.trim()] ? q.value.trim() : null);
+  if (!sno) return;
+  picked.querySelector(`[data-sno="${sno}"]`)?.remove();
+  picked.prepend(renderStation(sno, { removable: true }));
+  q.value = "";
+}
+q.addEventListener("change", pick);
+q.addEventListener("keydown", e => { if (e.key === "Enter") pick(); });
 </script>
 </body>
 </html>
