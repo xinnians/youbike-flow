@@ -14,12 +14,14 @@ REF = [
     Station("3", "公館站", "臺北市", 25.0, 121.5),
     Station("4", "捷運淡水站", "新北市", 25.2, 121.4),
     Station("5", "新名稱站", "臺北市", 25.0, 121.6),
+    Station("6", "金龍公園", "臺北市", 25.0, 121.6),
+    Station("7", "金龍公園", "新北市", 25.0, 121.6),
 ]
 
 
 def test_resolve_methods():
     r = resolve(
-        ["糖廍文化園區", "糖?文化園區", "公?承德路口", "捷運淡水站", "舊名稱站", "蘆洲維修中心", "瑞光維護所", "不存在"],
+        ["糖廍文化園區", "糖?文化園區", "公?承德路口", "捷運淡水站", "舊名稱站", "蘆洲維修中心", "瑞光維護所", "不存在", "金龍公園"],
         REF, {"舊名稱站": "新名稱站"},
     )
     assert {k: (s.sno if s else None, m) for k, (s, m) in r.items()} == {
@@ -31,6 +33,7 @@ def test_resolve_methods():
         "蘆洲維修中心": (None, "non_station"),
         "瑞光維護所": (None, "non_station"),
         "不存在": (None, "unmatched"),
+        "金龍公園": ("6", "exact_ambiguous"),
     }
 
 
@@ -79,3 +82,51 @@ def test_build_month_tolerates_formats(tmp_path, monkeypatch, encoding, header):
         (datetime(2026, 5, 1, 10), "捷運公館站", 3723, "2026-05-01"),
         (datetime(2026, 5, 2, 8), "公館站", 599, "2026-05-02"),
     ]
+
+
+def test_analyze_excludes_gap_days_and_uses_station_window(tmp_path, monkeypatch):
+    from flows import analyze
+
+    monkeypatch.setattr(analyze, "load_reference", lambda: [
+        Station("A", "甲站", "臺北市", 25.0, 121.5),
+        Station("B", "乙站", "臺北市", 25.0, 121.5),
+        Station("N", "新北站", "新北市", 25.0, 121.4),
+    ])
+    monkeypatch.setattr(analyze, "load_aliases", lambda: {})
+    cal = tmp_path / "calendar_test.csv"
+    cal.write_text("﻿西元日期,星期,是否放假,備註\n" + "".join(
+        f"2026050{d},{w},{h},\n" for d, w, h in
+        [(4, "一", 0), (5, "二", 0), (6, "三", 0), (7, "四", 0), (8, "五", 0), (9, "六", 2)]), encoding="utf-8")
+
+    rows = []
+    for day in range(4, 10):
+        for hr in range(24):
+            if day == 6 and hr >= 8:  # 5/6 早上 8 點後沒資料 → 整天排除
+                continue
+            rows.append((f"2026-05-0{day} {hr:02d}:00:00", "乙站", "乙站"))
+    rows += [("2026-05-07 10:00:00", "甲站", "乙站")] * 3   # 甲站 5/7 才開始營運
+    rows += [("2026-05-08 09:00:00", "甲站", "新北站")]
+    con = duckdb.connect()
+    con.execute("CREATE TABLE raw (ts VARCHAR, a VARCHAR, b VARCHAR)")
+    con.executemany("INSERT INTO raw VALUES (?, ?, ?)", rows)
+    trips = tmp_path / "trips.parquet"
+    con.execute(f"""COPY (SELECT ts::TIMESTAMP AS rent_time, a AS rent_station, ts::TIMESTAMP AS return_time,
+                    b AS return_station, 600 AS duration_sec, '一般車' AS bike_type, ts::DATE AS info_date FROM raw)
+                    TO '{trips}' (FORMAT parquet)""")
+
+    analyze.load_calendar(con, [cal])
+    summary = analyze.build(con, trips.as_posix())
+
+    assert summary["valid_days"] == {"假日": 1, "平日": 4}
+    assert [d[0] for d in summary["excluded_days(date, day_type, trips, hours_with_data)"]] == ["2026-05-06"]
+
+    top = con.execute("""SELECT station, direction, rank, other_station, same_station, trips, n_days, trips_per_day, share_pct
+                         FROM top_flows WHERE day_type = '平日' ORDER BY station, direction, rank""").fetchall()
+    assert ("甲站", "去向", 1, "乙站", False, 3, 2, 1.5, 75.0) in top      # 分母只算甲站營運的 2 個平日
+    assert ("甲站", "去向", 2, "新北站", False, 1, 2, 0.5, 25.0) in top
+    assert ("乙站", "來源", 1, "乙站", True, 96, 4, 24.0, 97.0) in top     # 5/6 的 8 筆不算
+    assert not any(r[0] == "新北站" for r in top)                            # 只分析臺北市站
+
+    net = con.execute("""SELECT rents_per_day, returns_per_day, net_per_day FROM net_flow_hourly
+                         WHERE station = '乙站' AND day_type = '平日' AND hour = 10""").fetchone()
+    assert net == (1.0, 1.75, 0.75)

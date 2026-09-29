@@ -5,10 +5,17 @@
 輸入：raw/trips/*.parquet（flows.build_trips）、raw/stations_ref.csv（flows.stations）、
       data/calendar_*.csv（人事行政總處辦公日曆表，「是否放假=2」視為假日，含補班日判斷）
 輸出（out/）：
-  top_flows.csv        station, sno, day_type, direction(去向/來源), rank, other_station, other_sno, trips, trips_per_day, share_pct
-  net_flow_hourly.csv  station, sno, day_type, hour, rents_per_day, returns_per_day, net_per_day（正值＝還入多於借出）
+  top_flows.csv        station, sno, day_type, direction(去向/來源), rank, other_station, other_sno,
+                       same_station(借還同站), trips, n_days(分母), trips_per_day, share_pct
+  net_flow_hourly.csv  station, sno, day_type, hour, n_days, rents_per_day, returns_per_day,
+                       net_per_day（正值＝還入多於借出；先相減再四捨五入）
   station_match.csv    租借紀錄站名的比對結果與影響的借還次數
   summary.txt          資料期間、筆數、比對覆蓋率
+定義：
+- 去向／借出量用借車時間歸日與小時，來源／還入量用還車時間，兩表不能逐筆對帳（跨日型行程約 0.09%）
+- 有任何一小時完全沒有借車紀錄的日子整天排除（資料缺漏或停止營運）；下雨等真實低量日保留
+- 分母＝該站營運期間（第一筆到最後一筆紀錄）內的有效日數
+- share_pct 的分母含另一端對不上站名的行程
 限制：資料只含「在臺北市借出」的車（2026-05～07 實測），從新北騎進臺北的車不在其中，
       市界附近站點的「來源」與淨流量會偏低。借還時間只到小時。
 """
@@ -51,7 +58,7 @@ def build(con: duckdb.DuckDBPyConnection, trips_glob: str) -> dict:
     con.execute("""
         CREATE OR REPLACE TABLE t AS
         SELECT coalesce(mr.name, trips.rent_station) AS rent_station, mr.sno AS rent_sno, mr.city AS rent_city,
-               coalesce(mt.name, trips.return_station) AS return_station, mt.sno AS return_sno,
+               coalesce(mt.name, trips.return_station) AS return_station, mt.sno AS return_sno, mt.city AS return_city,
                rent_time, return_time
         FROM trips
         LEFT JOIN match mr ON trips.rent_station = mr.raw_name
@@ -60,27 +67,44 @@ def build(con: duckdb.DuckDBPyConnection, trips_glob: str) -> dict:
           AND trips.rent_station IS NOT NULL AND trips.return_station IS NOT NULL
     """)
 
-    # 各日型的天數（分母）：只算資料期間內的日期
+    # 所有「站 × 事件」：去向用借車時間、來源用還車時間決定日期與小時
     con.execute("""
-        CREATE OR REPLACE TABLE days AS
-        SELECT day_type, count(*) AS n_days FROM calendar
-        WHERE d BETWEEN (SELECT min(rent_time)::DATE FROM t) AND (SELECT max(rent_time)::DATE FROM t)
-        GROUP BY 1
+        CREATE OR REPLACE TABLE legs AS
+        SELECT rent_station AS station, rent_sno AS sno, '去向' AS direction,
+               return_station AS other_station, return_sno AS other_sno, rent_time AS ts
+        FROM t WHERE rent_city = '臺北市'
+        UNION ALL
+        SELECT return_station, return_sno, '來源', rent_station, rent_sno, return_time
+        FROM t WHERE return_city = '臺北市'
+    """)
+
+    # 有任何一個小時完全沒有借車紀錄的日子整天排除（不進分子也不進分母）。
+    # 臺北市凌晨每小時也有上千筆，整小時 0 筆代表資料缺漏或停止營運（例如 2026-07-10 早上 8 點後、07-11 整天）。
+    # 不用「總量偏低」判斷：梅雨、雷雨日總量可能只有平常 1/4，但那是真實狀況，應該留著。
+    con.execute("""
+        CREATE OR REPLACE TABLE day_stats AS
+        WITH n AS (SELECT rent_time::DATE AS d, count(*) AS trips, count(DISTINCT hour(rent_time)) AS hours
+                   FROM t GROUP BY 1)
+        SELECT c.d, c.day_type, coalesce(n.trips, 0) AS trips, coalesce(n.hours, 0) AS hours_with_data
+        FROM calendar c LEFT JOIN n USING (d)
+        WHERE c.d BETWEEN (SELECT min(rent_time)::DATE FROM t) AND (SELECT max(rent_time)::DATE FROM t)
+    """)
+    con.execute("CREATE OR REPLACE TABLE valid_days AS SELECT d, day_type FROM day_stats WHERE hours_with_data = 24")
+
+    # 分母：每站只算它實際有營運的期間（第一筆到最後一筆紀錄）內的有效日數，期間中開站／撤站的站才不會被低估
+    con.execute("""
+        CREATE OR REPLACE TABLE station_days AS
+        WITH w AS (SELECT station, min(ts)::DATE AS first_d, max(ts)::DATE AS last_d FROM legs GROUP BY 1)
+        SELECT w.station, v.day_type, count(*) AS n_days, any_value(w.first_d) AS first_d, any_value(w.last_d) AS last_d
+        FROM w JOIN valid_days v ON v.d BETWEEN w.first_d AND w.last_d
+        GROUP BY 1, 2
     """)
 
     con.execute(f"""
         CREATE OR REPLACE TABLE top_flows AS
-        WITH legs AS (
-          SELECT rent_station AS station, rent_sno AS sno, '去向' AS direction,
-                 return_station AS other_station, return_sno AS other_sno, rent_time::DATE AS d
-          FROM t WHERE rent_city = '臺北市'
-          UNION ALL
-          SELECT return_station, return_sno, '來源', rent_station, rent_sno, return_time::DATE
-          FROM t WHERE return_sno IN (SELECT sno FROM match WHERE city = '臺北市')
-        ),
-        agg AS (
-          SELECT station, sno, c.day_type, direction, other_station, other_sno, count(*) AS trips
-          FROM legs JOIN calendar c ON legs.d = c.d
+        WITH agg AS (
+          SELECT station, sno, v.day_type, direction, other_station, other_sno, count(*) AS trips
+          FROM legs JOIN valid_days v ON legs.ts::DATE = v.d
           GROUP BY ALL
         ),
         ranked AS (
@@ -88,32 +112,28 @@ def build(con: duckdb.DuckDBPyConnection, trips_glob: str) -> dict:
                  100.0 * trips / sum(trips) OVER (PARTITION BY station, day_type, direction) AS share_pct
           FROM agg WINDOW w AS (PARTITION BY station, day_type, direction ORDER BY trips DESC, other_station)
         )
-        SELECT r.station, r.sno, r.day_type, r.direction, r.rank, r.other_station, r.other_sno, r.trips,
-               round(r.trips / days.n_days, 2) AS trips_per_day, round(r.share_pct, 1) AS share_pct
-        FROM ranked r JOIN days USING (day_type)
+        SELECT r.station, r.sno, r.day_type, r.direction, r.rank, r.other_station, r.other_sno,
+               r.station = r.other_station AS same_station, r.trips, sd.n_days,
+               round(r.trips / sd.n_days, 2) AS trips_per_day, round(r.share_pct, 1) AS share_pct
+        FROM ranked r JOIN station_days sd USING (station, day_type)
         WHERE r.rank <= {TOP_N}
         ORDER BY r.station, r.day_type, r.direction, r.rank
     """)
 
     con.execute("""
         CREATE OR REPLACE TABLE net_flow_hourly AS
-        WITH ev AS (
-          SELECT rent_station AS station, rent_sno AS sno, rent_time AS ts, 1 AS rent, 0 AS ret
-          FROM t WHERE rent_city = '臺北市'
-          UNION ALL
-          SELECT return_station, return_sno, return_time, 0, 1
-          FROM t WHERE return_sno IN (SELECT sno FROM match WHERE city = '臺北市')
-        ),
-        agg AS (
-          SELECT station, sno, c.day_type, hour(ts) AS hour, sum(rent) AS rents, sum(ret) AS returns
-          FROM ev JOIN calendar c ON ts::DATE = c.d
+        WITH agg AS (
+          SELECT station, sno, v.day_type, hour(ts) AS hour,
+                 count(*) FILTER (direction = '去向') AS rents,
+                 count(*) FILTER (direction = '來源') AS returns
+          FROM legs JOIN valid_days v ON legs.ts::DATE = v.d
           GROUP BY ALL
         )
-        SELECT station, sno, day_type, hour,
+        SELECT station, sno, day_type, hour, n_days,
                round(rents / n_days, 2) AS rents_per_day,
                round(returns / n_days, 2) AS returns_per_day,
                round((returns - rents) / n_days, 2) AS net_per_day
-        FROM agg JOIN days USING (day_type)
+        FROM agg JOIN station_days USING (station, day_type)
         ORDER BY station, day_type, hour
     """)
 
@@ -131,17 +151,27 @@ def build(con: duckdb.DuckDBPyConnection, trips_glob: str) -> dict:
     kept = con.execute("SELECT count(*) FROM t").fetchone()[0]
     rent_nomatch, ret_nomatch = con.execute(
         "SELECT count(*) FILTER (rent_sno IS NULL), count(*) FILTER (return_sno IS NULL) FROM t").fetchone()
-    period = con.execute("SELECT min(rent_time)::DATE, max(rent_time)::DATE FROM t").fetchone()
-    days = dict(con.execute("SELECT day_type, n_days FROM days").fetchall())
+    period = con.execute("SELECT min(d), max(d) FROM day_stats").fetchone()
+    days = dict(con.execute("SELECT day_type, count(*) FROM valid_days GROUP BY 1 ORDER BY 1").fetchall())
+    excluded = con.execute(
+        "SELECT d::VARCHAR, day_type, trips, hours_with_data FROM day_stats ANTI JOIN valid_days USING (d) ORDER BY d").fetchall()
+    trips_valid = con.execute("SELECT count(*) FROM t WHERE rent_time::DATE IN (SELECT d FROM valid_days)").fetchone()[0]
+    partial = con.execute("""
+        SELECT count(DISTINCT station) FROM station_days
+        WHERE first_d > (SELECT min(d) FROM valid_days) OR last_d < (SELECT max(d) FROM valid_days)
+    """).fetchone()[0]
     methods = dict(con.execute(
-        "SELECT method, sum(rent_trips + return_trips) FROM station_match GROUP BY 1").fetchall())
+        "SELECT method, sum(rent_trips + return_trips) FROM station_match GROUP BY 1 ORDER BY 1").fetchall())
     return {
-        "period": f"{period[0]} ~ {period[1]}", "days": days, "trips_total": total, "trips_used": kept,
-        "trips_per_day": round(total / sum(days.values())),
+        "period": f"{period[0]} ~ {period[1]}", "valid_days": days,
+        "excluded_days(date, day_type, trips, hours_with_data)": excluded,
+        "trips_total": total, "trips_used": kept,
+        "trips_per_valid_day": round(trips_valid / sum(days.values())),
         "rent_unmatched_pct": round(100 * rent_nomatch / kept, 2),
         "return_unmatched_pct": round(100 * ret_nomatch / kept, 2),
         "match_methods_trip_ends": methods,
         "stations_with_top_flows": con.execute("SELECT count(DISTINCT station) FROM top_flows").fetchone()[0],
+        "stations_with_partial_window": partial,
     }
 
 

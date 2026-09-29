@@ -5,6 +5,7 @@
 2. data/station_aliases.csv 手動對照（改名、撤站）
 3. 原始資料裡罕用字會掉成 "?"（例如「糖?文化園區」），把 ? 當任意一個字比對，唯一符合才採用
 維修中心、維護所、放置場等不是站點的名稱標為 non_station。
+臺北、新北同名的站只看名稱分不出來，標為 exact_ambiguous（租借紀錄只含臺北借出，借車端必為臺北；還車端不確定）。
 """
 from __future__ import annotations
 
@@ -79,14 +80,19 @@ def load_aliases(path: Path = ALIAS_PATH) -> dict[str, str]:
 
 
 def resolve(names, stations: list[Station], aliases: dict[str, str]) -> dict[str, tuple[Station | None, str]]:
-    """回傳 {租借紀錄站名: (對到的站或 None, 方法)}；方法為 exact/alias/wildcard/non_station/unmatched。"""
+    """回傳 {租借紀錄站名: (對到的站或 None, 方法)}。
+
+    方法：exact / exact_ambiguous（臺北、新北同名，暫以臺北市為準）/ alias / wildcard / non_station / unmatched
+    """
     by_name: dict[str, Station] = {}
+    cities: dict[str, set[str]] = {}
     for s in stations:
         by_name.setdefault(s.name, s)  # 臺北市在前，同名時以臺北市為準
+        cities.setdefault(s.name, set()).add(s.city)
     result = {}
     for n in names:
         if n in by_name:
-            result[n] = (by_name[n], "exact")
+            result[n] = (by_name[n], "exact_ambiguous" if len(cities[n]) > 1 else "exact")
         elif n in aliases and aliases[n] in by_name:
             result[n] = (by_name[aliases[n]], "alias")
         elif "?" in n:
