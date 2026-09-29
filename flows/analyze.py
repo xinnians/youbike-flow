@@ -6,7 +6,7 @@
       data/calendar_*.csv（人事行政總處辦公日曆表，「是否放假=2」視為假日，含補班日判斷）
 輸出（out/）：
   top_flows.csv        station, sno, day_type, direction(去向/來源), rank, other_station, other_sno,
-                       same_station(借還同站), trips, n_days(分母), trips_per_day, share_pct
+                       trips, n_days(分母), trips_per_day, share_pct（同站借還不列入排名與占比分母）
   net_flow_hourly.csv  station, sno, day_type, hour, n_days, rents_per_day, returns_per_day,
                        net_per_day（正值＝還入多於借出；先相減再四捨五入）
   station_match.csv    租借紀錄站名的比對結果與影響的借還次數
@@ -16,6 +16,7 @@
 - 有任何一小時完全沒有借車紀錄的日子整天排除（資料缺漏或停止營運）；下雨等真實低量日保留
 - 分母＝該站營運期間（第一筆到最後一筆紀錄）內的有效日數
 - share_pct 的分母含另一端對不上站名的行程
+- 同站借還不進 top_flows，但仍計入 net_flow_hourly（借出到還回之間車確實不在站上）
 限制：資料只含「在臺北市借出」的車（2026-05～07 實測），從新北騎進臺北的車不在其中，
       市界附近站點的「來源」與淨流量會偏低。借還時間只到小時。
 """
@@ -105,6 +106,7 @@ def build(con: duckdb.DuckDBPyConnection, trips_glob: str) -> dict:
         WITH agg AS (
           SELECT station, sno, v.day_type, direction, other_station, other_sno, count(*) AS trips
           FROM legs JOIN valid_days v ON legs.ts::DATE = v.d
+          WHERE station <> other_station  -- 同站借還不列入排名，也不進 share_pct 分母
           GROUP BY ALL
         ),
         ranked AS (
@@ -112,8 +114,7 @@ def build(con: duckdb.DuckDBPyConnection, trips_glob: str) -> dict:
                  100.0 * trips / sum(trips) OVER (PARTITION BY station, day_type, direction) AS share_pct
           FROM agg WINDOW w AS (PARTITION BY station, day_type, direction ORDER BY trips DESC, other_station)
         )
-        SELECT r.station, r.sno, r.day_type, r.direction, r.rank, r.other_station, r.other_sno,
-               r.station = r.other_station AS same_station, r.trips, sd.n_days,
+        SELECT r.station, r.sno, r.day_type, r.direction, r.rank, r.other_station, r.other_sno, r.trips, sd.n_days,
                round(r.trips / sd.n_days, 2) AS trips_per_day, round(r.share_pct, 1) AS share_pct
         FROM ranked r JOIN station_days sd USING (station, day_type)
         WHERE r.rank <= {TOP_N}

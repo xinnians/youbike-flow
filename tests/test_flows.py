@@ -120,13 +120,14 @@ def test_analyze_excludes_gap_days_and_uses_station_window(tmp_path, monkeypatch
     assert summary["valid_days"] == {"假日": 1, "平日": 4}
     assert [d[0] for d in summary["excluded_days(date, day_type, trips, hours_with_data)"]] == ["2026-05-06"]
 
-    top = con.execute("""SELECT station, direction, rank, other_station, same_station, trips, n_days, trips_per_day, share_pct
+    top = con.execute("""SELECT station, direction, rank, other_station, trips, n_days, trips_per_day, share_pct
                          FROM top_flows WHERE day_type = '平日' ORDER BY station, direction, rank""").fetchall()
-    assert ("甲站", "去向", 1, "乙站", False, 3, 2, 1.5, 75.0) in top      # 分母只算甲站營運的 2 個平日
-    assert ("甲站", "去向", 2, "新北站", False, 1, 2, 0.5, 25.0) in top
-    assert ("乙站", "來源", 1, "乙站", True, 96, 4, 24.0, 97.0) in top     # 5/6 的 8 筆不算
-    assert not any(r[0] == "新北站" for r in top)                            # 只分析臺北市站
+    assert top == [
+        ("乙站", "來源", 1, "甲站", 3, 4, 0.75, 100.0),   # 乙站→乙站的同站借還不列入排名
+        ("甲站", "去向", 1, "乙站", 3, 2, 1.5, 75.0),     # 分母只算甲站營運的 2 個平日
+        ("甲站", "去向", 2, "新北站", 1, 2, 0.5, 25.0),   # 新北站本身不分析（只分析臺北市站）
+    ]
 
     net = con.execute("""SELECT rents_per_day, returns_per_day, net_per_day FROM net_flow_hourly
                          WHERE station = '乙站' AND day_type = '平日' AND hour = 10""").fetchone()
-    assert net == (1.0, 1.75, 0.75)
+    assert net == (1.0, 1.75, 0.75)  # 同站借還仍計入淨流量；5/6 的紀錄不算
