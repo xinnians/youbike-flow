@@ -5,7 +5,8 @@
 金鑰：從環境變數或專案根目錄的 .env 讀取 TDX_CLIENT_ID、TDX_CLIENT_SECRET，程式不會印出。
 計費（官方，2024-04-01 起）：歷史服務每 10 次 1 點、每 20MB 1 點，兩者合併計算；基礎會員每月 3 點。
       點數用完有 5% 緩衝，再用完當月停用，不會自動扣款（交通部收費要點第六點）。
-用量護欄：本機 .tdx_usage.json 記錄每月估計點數（以未壓縮大小估，偏保守），
+      官方常見問題：請求帶 Accept-Encoding 會壓縮回傳，可「降低資料存取量」與費用，所以以壓縮後傳輸量計點。
+用量護欄：本機 .tdx_usage.json 記錄每月的呼叫次數與傳輸量，換算估計點數，
       這次呼叫的估計值加上去會超過 BUDGET_POINTS 就拒絕執行。
 """
 from __future__ import annotations
@@ -38,7 +39,8 @@ MONTHLY_POINTS = 3.0
 BUDGET_POINTS = 2.5          # 自訂上限，留 0.5 點餘裕
 POINTS_PER_CALL = 0.1        # 10 次 / 1 點
 MB_PER_POINT = 20.0          # 20MB / 1 點
-EST_BYTES_PER_ROW = 120      # 呼叫前估算用（CSV 一列約 90–120 bytes）
+EST_BYTES_PER_ROW = 120      # 呼叫前估算用（未壓縮 CSV 一列約 110 bytes）
+GZIP_RATIO = 0.11            # 2026-09-29 探測：壓縮後約為原大小的 10.8%
 TAIPEI_STATIONS = 1808       # 2026-09-29 即時 API 站數
 MAX_RAW_BYTES = 3_000_000    # 萬一 $top 沒生效回傳整天資料，讀到這個量就中斷
 
@@ -64,8 +66,13 @@ class Ledger:
         self.path = path
         self.data = json.loads(path.read_text()) if path.exists() else {}
 
+    @staticmethod
+    def points(calls: int, raw_bytes: int) -> float:
+        return calls * POINTS_PER_CALL + raw_bytes / 1e6 / MB_PER_POINT
+
     def used(self, month: str) -> float:
-        return self.data.get(month, {}).get("points", 0.0)
+        m = self.data.get(month)
+        return self.points(m["calls"], m["raw_bytes"]) if m else 0.0
 
     def check(self, month: str, estimate: float) -> None:
         if self.used(month) + estimate > BUDGET_POINTS:
@@ -74,18 +81,17 @@ class Ledger:
                 f"會超過自訂上限 {BUDGET_POINTS} 點（每月免費 {MONTHLY_POINTS} 點）")
 
     def record(self, month: str, calls: int, raw_bytes: int, body_bytes: int) -> float:
-        points = calls * POINTS_PER_CALL + body_bytes / 1e6 / MB_PER_POINT
-        m = self.data.setdefault(month, {"calls": 0, "raw_bytes": 0, "body_bytes": 0, "points": 0.0})
+        m = self.data.setdefault(month, {"calls": 0, "raw_bytes": 0, "body_bytes": 0})
         m["calls"] += calls
         m["raw_bytes"] += raw_bytes
         m["body_bytes"] += body_bytes
-        m["points"] = round(m["points"] + points, 4)
+        m["points"] = round(self.points(m["calls"], m["raw_bytes"]), 4)
         self.path.write_text(json.dumps(self.data, indent=2))
-        return points
+        return self.points(calls, raw_bytes)
 
 
 class ResponseTooLarge(Exception):
-    """回應超過 MAX_RAW_BYTES，已中斷讀取。"""
+    """回應超過上限，已中斷讀取。args = (已讀位元組數, Content-Encoding 標頭, 內容是否為 gzip 魔術數字開頭)。"""
 
 
 def _ctx() -> ssl.SSLContext:
@@ -103,16 +109,17 @@ def get_token(cid: str, secret: str) -> str:
         return json.load(r)["access_token"]
 
 
-def fetch(token: str, date: str, top: int) -> tuple[int, bytes, dict]:
-    """回傳 (傳輸的原始位元組數, 解壓後內容, 回應標頭)。"""
-    q = urllib.parse.urlencode({"Dates": date, "$top": top, "$format": "CSV"}, safe="$")
+def fetch(token: str, date: str, top: int | None, max_raw_bytes: int = MAX_RAW_BYTES) -> tuple[int, bytes, dict]:
+    """回傳 (傳輸的原始位元組數, 解壓後內容, 回應標頭)。top=None 表示不限筆數。"""
+    params = {"Dates": date, "$format": "CSV"} | ({"$top": top} if top else {})
+    q = urllib.parse.urlencode(params, safe="$")
     req = urllib.request.Request(f"{HIST_URL}?{q}", headers={
         "authorization": f"Bearer {token}", "Accept-Encoding": "gzip"})
     with urllib.request.urlopen(req, timeout=120, context=_ctx()) as r:
         headers = dict(r.headers)
-        raw = r.read(MAX_RAW_BYTES + 1)
-    if len(raw) > MAX_RAW_BYTES:
-        raise ResponseTooLarge(len(raw))
+        raw = r.read(max_raw_bytes + 1)
+    if len(raw) > max_raw_bytes:
+        raise ResponseTooLarge(len(raw), headers.get("Content-Encoding", "無"), raw[:2] == b"\x1f\x8b")
     body = gzip.decompress(raw) if headers.get("Content-Encoding", "").lower() == "gzip" else raw
     return len(raw), body, headers
 
@@ -173,7 +180,7 @@ def main(argv: list[str] | None = None) -> int:
 
     month = datetime.now(TPE).strftime("%Y-%m")
     ledger = Ledger()
-    estimate = POINTS_PER_CALL + a.top * EST_BYTES_PER_ROW / 1e6 / MB_PER_POINT
+    estimate = POINTS_PER_CALL + a.top * EST_BYTES_PER_ROW * GZIP_RATIO / 1e6 / MB_PER_POINT
     ledger.check(month, estimate)
     cid, secret = load_credentials()
 
@@ -185,8 +192,9 @@ def main(argv: list[str] | None = None) -> int:
         print(f"TDX 回應 HTTP {e.code}：{e.read()[:300].decode('utf-8', 'replace')}", file=sys.stderr)
         return 1
     except ResponseTooLarge as e:
-        ledger.record(month, 1, e.args[0], e.args[0] * 10)  # 不知道解壓後多大，保守估 10 倍
-        print(f"回應超過 {MAX_RAW_BYTES:,} bytes，已中斷（$top 可能沒生效）。請到 TDX 會員中心確認實際扣點", file=sys.stderr)
+        ledger.record(month, 1, e.args[0], 0)
+        print(f"回應超過 {MAX_RAW_BYTES:,} bytes，已中斷（$top 可能沒生效；Content-Encoding={e.args[1]}，gzip 內容={e.args[2]}）。"
+              "請到 TDX 會員中心確認實際扣點", file=sys.stderr)
         return 1
     points = ledger.record(month, 1, raw_bytes, len(body))
 

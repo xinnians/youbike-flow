@@ -99,3 +99,17 @@ def test_pack_and_render(data_dir):
     html = availability.render_html(rows, names, {A: "瑞光路316巷"}, availability.summary(con))
     assert "/*__DATA__*/" not in html
     assert "瑞光路316巷<\\/script>" in html and html.count("</script>") == 1
+
+
+def test_backfill_is_included(data_dir):
+    from tdx.backfill import convert
+    head = "StationUID,StationID,ServiceStatus,ServiceType,AvailableRentBikes,AvailableReturnBikes,SrcUpdateTime,UpdateTime,GeneralBikes,ElectricBikes\n"
+    body = (head + "".join(f"TPE{A},{A},1,2,0,20,2026-09-24T17:{m:02d}:00+08:00,x,0,0\n" for m in (1, 4, 7))).encode()
+    convert(duckdb.connect(), body, data_dir / "backfill/tdx/date=2026-09-24/part-tdx.parquet")
+    con, n = _load(data_dir)
+    assert n == 9 * 1202 + 3
+    rows = {(r["sno"], r["day_type"], r["slot"]): r for r in availability.compute(con, {})}
+    r = rows[(A, "平日", "17:00")]
+    assert (r["n_days"], r["n_snapshots"]) == (3, 9)          # 9/24 回補 3 筆全無車
+    assert r["p_no_bike"] == pytest.approx(7 / 9, abs=0.001)
+    assert availability.summary(con)["by_source"] == {"collector": 9 * 1202, "tdx": 3}

@@ -33,10 +33,18 @@ def test_ledger_blocks_when_budget_exceeded(tmp_path):
     assert probe.Ledger(tmp_path / "u.json").used("2026-09") == pytest.approx(2.4)
 
 
-def test_ledger_counts_uncompressed_bytes(tmp_path):
+def test_ledger_counts_compressed_bytes(tmp_path):
     led = probe.Ledger(tmp_path / "u.json")
-    # 1 次呼叫 + 解壓後 10MB（傳輸 1MB）→ 保守以解壓後計：0.1 + 0.5
-    assert led.record("2026-09", 1, 1_000_000, 10_000_000) == pytest.approx(0.6)
+    # 1 次呼叫 + 傳輸 10MB（解壓後 95MB）→ 以壓縮後傳輸量計：0.1 + 0.5
+    assert led.record("2026-09", 1, 10_000_000, 95_000_000) == pytest.approx(0.6)
+    assert led.used("2026-09") == pytest.approx(0.6)
+
+
+def test_ledger_recomputes_old_entries(tmp_path):
+    # 舊版以未壓縮大小記的 points 欄位，改由 calls 與 raw_bytes 重算
+    f = tmp_path / "u.json"
+    f.write_text('{"2026-09": {"calls": 1, "raw_bytes": 59519, "body_bytes": 551146, "points": 0.1276}}')
+    assert probe.Ledger(f).used("2026-09") == pytest.approx(0.103, abs=0.001)
 
 
 def _csv(rows):
@@ -64,3 +72,31 @@ def test_analyze_sample_by_time_order_and_extrapolate():
     assert ex["rows_per_day"] == probe.TAIPEI_STATIONS * 3
     assert ex["points_per_day_if_uncompressed_counted"] == pytest.approx(
         ex["mb_per_day_uncompressed"] / 20, abs=0.01)
+
+
+def test_backfill_convert_to_snapshot_schema(tmp_path):
+    import duckdb
+    from collector.compact import _SNAPSHOT_TYPES
+    from tdx.backfill import convert
+
+    body = _csv([("500108171", "2026-09-23T17:02:03+08:00"), ("500108171", "2026-09-23T17:05:03+08:00")])
+    body += b"TPE500199999,500199999,0,2,0,0,2026-09-23T17:00:00+08:00,2026-09-23T17:00:00+08:00,0,0\n"
+    body += b"TPE500188888,500188888,1,1,0,0,2026-09-23T17:00:00+08:00,2026-09-23T17:00:00+08:00,0,0\n"  # YouBike1.0 排除
+    dest = tmp_path / "backfill/tdx/date=2026-09-23/part-tdx.parquet"
+    info = convert(duckdb.connect(), body, dest)
+    assert info["rows"] == 3 and info["stations"] == 2
+    got = duckdb.sql(f"SELECT * FROM '{dest}' ORDER BY sno, fetched_at").fetchall()
+    cols = [d[0] for d in duckdb.sql(f"DESCRIBE SELECT * FROM read_parquet('{dest}', hive_partitioning=false)").fetchall()]
+    assert cols == list(_SNAPSHOT_TYPES)
+    from datetime import datetime
+    assert got[0][:4] == (datetime(2026, 9, 23, 17, 2, 3), "2026-09-23T17:02:03+08:00", "500108171", 3)
+    assert got[2][2] == "500199999" and got[2][6] == "0"   # 停止營運 → act 0
+
+
+def test_backfill_convert_rejects_other_timezones(tmp_path):
+    import duckdb
+    from tdx.backfill import convert
+
+    body = _csv([("500108171", "2026-09-23T09:02:03+00:00")])
+    with pytest.raises(ValueError, match="08:00"):
+        convert(duckdb.connect(), body, tmp_path / "x.parquet")

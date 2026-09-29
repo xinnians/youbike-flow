@@ -223,7 +223,9 @@ function renderTable(parent, byType) {
 const m = DATA.meta;
 document.getElementById("meta").textContent =
   `資料期間 ${m.period || "—"}；平日 ${m.days["平日"] || 0} 天、假日 ${m.days["假日"] || 0} 天；` +
-  `${m.stations} 站、${m.snapshots} 筆快照（排除 ${m.excluded_stale_or_inactive} 筆）；產生於 ${m.generated}`;
+  `${m.stations} 站、${m.snapshots} 筆快照` +
+  (m.by_source && m.by_source.tdx ? `（含 TDX 回補 ${m.by_source.tdx} 筆）` : "") +
+  `，排除 ${m.excluded_stale_or_inactive} 筆；產生於 ${m.generated}`;
 const lowkey = document.getElementById("lowkey");
 const lk = document.createElement("i"); lk.style.cssText = "background:var(--text-muted);opacity:.3";
 lowkey.append(lk, document.createTextNode(`淡色＝樣本少於 ${m.min_days} 天`));

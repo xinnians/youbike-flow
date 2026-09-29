@@ -3,7 +3,8 @@
     git clone --branch data --single-branch https://github.com/xinnians/youbike-flow.git ~/youbike-data
     python -m predict.availability --data-dir ~/youbike-data
 
-輸入：收集器的 data 分支（snapshots/、stations/ 合併檔 + raw/ 當天小檔）、data/my_stations.csv、data/calendar_*.csv
+輸入：收集器的 data 分支（snapshots/、stations/ 合併檔 + raw/ 當天小檔 + backfill/ TDX 回補）、
+      data/my_stations.csv、data/calendar_*.csv
 輸出：
   out/availability_15min.csv   全部站點：sno, station, day_type, slot, n_days, n_snapshots,
                                p_no_bike, p_no_bike_any, p_no_dock, p_no_dock_any
@@ -53,9 +54,14 @@ def _sources(data_dir: Path, parquet_glob: str, csv_glob: str, types: dict[str, 
 
 
 def load_snapshots(con: duckdb.DuckDBPyConnection, data_dir: Path) -> int:
-    parts = _sources(data_dir, "snapshots/*/*.parquet", "raw/*/[0-9]*.csv.gz", _SNAPSHOT_TYPES)
+    parts = [f"SELECT *, 'collector' AS source FROM ({q})"
+             for q in _sources(data_dir, "snapshots/*/*.parquet", "raw/*/[0-9]*.csv.gz", _SNAPSHOT_TYPES)]
+    if list(data_dir.glob("backfill/*/*/*.parquet")):
+        # TDX 回補（tdx/backfill.py），欄位同快照
+        parts.append(f"SELECT {', '.join(_SNAPSHOT_TYPES)}, 'tdx' AS source "
+                     f"FROM '{(data_dir / 'backfill/*/*/*.parquet').as_posix()}'")
     if not parts:
-        raise SystemExit(f"{data_dir} 裡沒有快照（snapshots/ 或 raw/）")
+        raise SystemExit(f"{data_dir} 裡沒有快照（snapshots/、raw/ 或 backfill/）")
     con.execute(f"CREATE OR REPLACE TABLE snaps AS {' UNION ALL '.join(parts)}")
     return con.execute("SELECT count(*) FROM snaps").fetchone()[0]
 
@@ -73,7 +79,8 @@ def load_station_names(con: duckdb.DuckDBPyConnection, data_dir: Path) -> dict[s
 
 def compute(con: duckdb.DuckDBPyConnection, names: dict[str, str]) -> list[dict]:
     con.execute("CREATE OR REPLACE TABLE names (sno VARCHAR, station VARCHAR)")
-    con.executemany("INSERT INTO names VALUES (?, ?)", list(names.items()))
+    if names:
+        con.executemany("INSERT INTO names VALUES (?, ?)", list(names.items()))
     con.execute(f"""
         CREATE OR REPLACE TABLE availability AS
         WITH s AS (
@@ -109,7 +116,8 @@ def summary(con: duckdb.DuckDBPyConnection) -> dict:
     days = dict(con.execute("""
         SELECT c.day_type, count(DISTINCT s.fetched_at::DATE) FROM snaps s JOIN calendar c ON s.fetched_at::DATE = c.d GROUP BY 1
     """).fetchall())
-    return {"stations": stations, "snapshots": total, "excluded_stale_or_inactive": stale,
+    by_source = dict(con.execute("SELECT source, count(*) FROM snaps GROUP BY 1 ORDER BY 1").fetchall())
+    return {"stations": stations, "snapshots": total, "by_source": by_source, "excluded_stale_or_inactive": stale,
             "period": f"{t0:%Y-%m-%d %H:%M} ~ {t1:%Y-%m-%d %H:%M}" if t0 else "", "days": days}
 
 
