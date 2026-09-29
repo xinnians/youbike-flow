@@ -1,0 +1,104 @@
+# youbike-flow
+
+臺北市 YouBike 2.0 常用站的流向分析與無車預估（自用驗證版）。
+
+要驗證的假設：「如果事先知道常用站何時可能沒車、車都流去哪，我會改變出門時間或選站。」
+
+## 結構
+
+```
+collector/   每 5 分鐘抓即時車位 → data 分支（GitHub Actions）
+  snapshot.py              JSON → 精簡快照列（只用標準函式庫）
+  collect.py               抓一次、寫 raw/<日期>/<時分秒>.csv.gz
+  compact.py               把今天以前的小檔合併成 Parquet
+  push_to_data_branch.sh   Actions 用：sparse clone data 分支 → 抓 → 合併 → 推
+  coverage.py              完成條件檢查：15 分鐘時段覆蓋率
+flows/       租借紀錄流向分析（本機跑）
+  download.py      下載租借紀錄 zip
+  build_trips.py   zip → raw/trips/<年月>.parquet（容錯：編碼、欄位名、時間格式）
+  stations.py      站點參照表（臺北市＋新北市即時 API）與站名比對
+  analyze.py       前 5 名去向／來源、每小時淨流量（平日／假日）
+data/        小型參考資料（進 git）
+  calendar_115.csv       人事行政總處 115 年（2026）辦公日曆表
+  station_aliases.csv    站名手動對照（改名、撤站），目前是空的
+raw/, out/   下載檔與分析輸出（不進 git，可用指令重建）
+```
+
+## 收集器
+
+### data 分支的檔案配置
+
+```
+raw/<日期>/<HHMMSS>.csv.gz              當天每次抓取一個檔（約 11KB）
+raw/<日期>/stations.csv.gz              當天第一次抓取時存站點靜態資訊
+snapshots/date=<日期>/part-*.parquet    隔天合併後的快照
+stations/date=<日期>/part-*.parquet     隔天合併後的站點資訊
+```
+
+快照欄位：`fetched_at, feed_update_time, sno, rent_bikes, return_slots, quantity, act, info_time`。
+
+- 判斷站點是否失聯要看 `info_time`（每站自己的時間）。`feed_update_time` 所有站都一樣，只能看出整份 API 有沒有更新
+- `quantity` 不一定等於 `rent_bikes + return_slots`（2026-09-29 實測 1,808 站中有 631 站不等）
+
+設計取捨：
+- 資料放獨立的 `data` 分支：每 5 分鐘一個 commit，放 `main` 會讓本機的 main 永遠落後
+- Actions 只 clone `raw/`（blobless + sparse），已合併的 Parquet 不下載，checkout 時間不隨資料量變長
+- 每 5 分鐘一個小檔、隔天合併：直接反覆改寫同一個 Parquet 檔，git 歷史每次都會多存一份整檔
+- 排程在每小時的 2、7、12…57 分，避開整點（官方文件：整點負載高，排隊的 job 可能被丟棄）
+- git 歷史估計每月增加約 150MB `[推論]`（每次快照 11KB × 288 次/天，加上合併檔）。驗證期（4 週）沒問題；長期使用要定期把 data 分支壓成單一 commit
+
+### 啟用步驟（要你操作）
+
+1. 在 GitHub 建一個**公開** repo（私有 repo 的 Actions 額度每月 2,000 分鐘，每 5 分鐘跑一次會超過）
+2. `git remote add origin <repo>` 後 push `main`
+3. 到 repo 的 Actions 頁手動執行一次 `collect` workflow（`workflow_dispatch`），確認有建出 `data` 分支
+4. 之後每 5 分鐘自動執行
+
+### 完成條件
+
+連續 3 天、≥ 95% 的 15 分鐘時段至少有 1 筆快照：
+
+```bash
+git clone --branch data --single-branch <repo> ../youbike-data
+.venv/bin/python -m collector.coverage --data-dir ../youbike-data --start <第一個完整日> --days 3
+```
+
+## 流向分析
+
+```bash
+python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
+.venv/bin/python -m flows.download --latest 3     # 約 360MB
+.venv/bin/python -m flows.build_trips             # → raw/trips/*.parquet、out/build_report.csv
+.venv/bin/python -m flows.stations                # → raw/stations_ref.csv（抓當下的站點清單）
+.venv/bin/python -m flows.analyze                 # → out/*.csv、out/summary.txt
+```
+
+輸出：
+- `out/top_flows.csv`：每站 × 平日/假日 × 去向/來源的前 5 名，含每日平均次數與占比
+- `out/net_flow_hourly.csv`：每站 × 平日/假日 × 小時的平均借出、還入、淨流量（正值＝還入多於借出）
+- `out/station_match.csv`：租借紀錄站名的比對結果與影響的借還次數；對不上的站名填進 `data/station_aliases.csv` 後重跑
+- `out/summary.txt`：期間、筆數、比對覆蓋率
+
+### 資料限制（2026-05～07 實測）
+
+- **借還時間只到小時**（分秒全為 0），流向只能做到每小時，不能做 15 分鐘
+- **只含在臺北市借出的車**：借車站沒有任何一個是新北專屬站名，還車站則包含新北。從新北騎進臺北的車不在資料裡，靠近市界的站，「來源」與淨流量會偏低
+- 罕用字（廍、舘、瑠…）在原始資料變成 `?`；這些字不在 Big5 字集，推測資料曾經過 Big5 轉換 `[推論]`。用萬用字元比對後，都能唯一對回正確站名
+- 期間內日均約 23.9 萬筆，比原先估計的 8 萬高很多（來源：`out/summary.txt` 的 `trips_per_day`）
+- 無法判斷改名或撤站的站：`景勤二號公園`、`忠孝東路五段215巷口`、`洲子二號公園`、`六張犁社會住宅B基地`，合計影響約 0.08% 的借還次數
+
+## 資料來源查證紀錄（2026-09-29）
+
+| 來源 | 狀態 |
+|---|---|
+| 即時 API | 1,808 站；欄位名是 `Quantity`，不是 `total` |
+| 租借紀錄（data.taipei） | 最新到 2026-07（索引檔 2026-09-07 更新）；data.taipei 憑證缺 SKI，Python 3.13+ 要關掉 `VERIFY_X509_STRICT` |
+| 社群歷史資料（tses89214） | 2024-05-03～2025-06-22、每 10 分鐘一筆，**已停更**，補不了最近的資料 |
+| TDX 歷史車位 | `/api/historical/v2/Historical/Bike/Availability/{City}?Dates=`，一次最多 7 天，最早 2021-06-01（依據第三方 R 套件 `ChiaJung-Yeh/NYCU_TDX` 的原始碼）；**粒度與最新可查日期未驗證，要先申請帳號** |
+| 新北即時 API | `data.ntpc.gov.tw` 資料集 `010e5b15-…`，1,610 站，用來補還到新北的站點座標 |
+
+## 待辦
+
+- [ ] 申請 TDX 帳號（Client Id／Secret），實測歷史車位的粒度與日期範圍，寫回補腳本
+- [ ] 推上 GitHub、啟用 Actions，3 天後跑 `collector.coverage`
+- [ ] 提供常用站清單（5–10 站）
