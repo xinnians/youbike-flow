@@ -132,7 +132,10 @@ git clone --branch data --single-branch https://github.com/xinnians/youbike-flow
 - **不會自動扣款**：基礎會員每月免費 3 點，點數用完後有 5% 緩衝，之後當月停用；要付費必須自己主動訂閱（[交通部收費要點](https://www.motc.gov.tw/ch/app/data/doc?id=14&module=news&detailNo=1107913081326931968&serno=44e2cc94-8a1b-4fc0-b70e-f07551a05e2a&type=s&preview=&aplistdn=)第五、六點）
 - 歷史服務計費：每 10 次 1 點、每 20MB 1 點，兩者合併；基礎會員每把金鑰每分鐘最多 5 次（[訂閱收費](https://tdx.transportdata.tw/pricing)）
 - 歷史車位 API（`/v2/Historical/Bike/Availability/{City}`）只有 `Dates`（一次最多 7 天）、`$top`、`$format`、`Meta` 參數，**不能篩選站點**，每次都回傳整個縣市的資料。資料從 2021-06 到昨天，每天早上 8 點更新
-- 所以免費額度大概只夠查一天的全市資料 `[推論]`，不適合拿來回補
+- **探測結果（2026-09-29，查 2026-09-28、`$top=5000`）**：每站一天約 477 筆（中位間隔 2 分鐘，中間有空檔）；回傳依站號排序；每列約 110 bytes，gzip 壓縮率約 10.8%。推估全臺北一天約 86 萬筆，未壓縮 95MB、壓縮後 10MB
+  - 若 TDX 以**未壓縮**大小計費：一天約 4.8 點，超過每月 3 點，連一天都查不完
+  - 若以**壓縮後**大小計費：一天約 0.5 點。因為回傳依站號排序，用 `$top` 只取到自己的站為止（瑞光路316巷排第 1,084 站），一天約 0.4 點，每月最多約 7 天 `[推論]`
+  - 本次呼叫：未壓縮計約 0.128 點，壓縮後計約 0.103 點。到會員中心看實際扣點，就知道是哪一種
 
 探測步驟（只呼叫 1 次，約扣 0.15 點）：
 
@@ -145,6 +148,7 @@ cp .env.example .env    # 填入 TDX_CLIENT_ID、TDX_CLIENT_SECRET；.env 不進
 
 ## 待辦
 
-- [ ] 建立 `.env`，執行 `python -m tdx.probe`，確認資料時間間隔，並核對是按壓縮前還是壓縮後的大小扣點
+- [x] 建立 `.env`，執行 `python -m tdx.probe`（2026-09-29）
+- [ ] 到 TDX 會員中心核對這次扣了 0.128 點（未壓縮計）還是約 0.103 點（壓縮後計）
 - [ ] 確認 GitHub Actions 排程有正常觸發；3 天後執行 `collector.coverage`
 - [ ] 約 10/20 樣本夠了之後，看 `out/availability.html`，進入第 3–4 週實際使用與記錄

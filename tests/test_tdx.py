@@ -47,9 +47,11 @@ def _csv(rows):
 
 def test_analyze_sample_by_station_order():
     rows = [(s, f"2026-09-28T00:{m:02d}:00+08:00") for s in ("500101001", "500101002") for m in range(0, 30, 5)]
+    rows += [("500101003", "2026-09-28T00:00:00+08:00")]  # 被 $top 截斷的最後一站
     r = probe.analyze_sample(_csv(rows))
-    assert r["rows"] == 12 and r["stations"] == 2
+    assert r["rows"] == 13 and r["stations"] == 3
     assert r["median_interval_min"] == 5 and r["order"] == "依站點"
+    assert r["rows_per_station"] == 6
 
 
 def test_analyze_sample_by_time_order_and_extrapolate():
@@ -58,6 +60,7 @@ def test_analyze_sample_by_time_order_and_extrapolate():
     r = probe.analyze_sample(body)
     assert r["median_interval_min"] == 1 and r["order"] == "依時間"
     ex = probe.extrapolate(r, raw_bytes=len(body) // 10, body_bytes=len(body))
-    assert ex["rows_per_day"] == probe.TAIPEI_STATIONS * 1440
+    assert r["rows_per_station"] == 3
+    assert ex["rows_per_day"] == probe.TAIPEI_STATIONS * 3
     assert ex["points_per_day_if_uncompressed_counted"] == pytest.approx(
         ex["mb_per_day_uncompressed"] / 20, abs=0.01)

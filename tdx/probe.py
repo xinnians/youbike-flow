@@ -131,6 +131,9 @@ def analyze_sample(body: bytes) -> dict:
     for ts in per_station.values():
         ts.sort()
         deltas += [(b - a).total_seconds() / 60 for a, b in zip(ts, ts[1:]) if b > a]
+    # 依站點排序時，最後一站多半被 $top 截斷，只用前面完整的站估每站每日筆數
+    counts = [len(ts) for uid, ts in sorted(per_station.items())]
+    full = counts[:-1] if len(counts) > 1 else counts
     order = "依站點" if [r["StationUID"] for r in rows] == sorted(r["StationUID"] for r in rows) else \
             "依時間" if [r[time_col] for r in rows] == sorted(r[time_col] for r in rows) else "其他"
     return {
@@ -138,6 +141,7 @@ def analyze_sample(body: bytes) -> dict:
         "columns": list(rows[0].keys()),
         "stations": len(per_station),
         "median_interval_min": statistics.median(deltas) if deltas else None,
+        "rows_per_station": statistics.median(full),
         "order": order,
         "bytes_per_row": len(body) / len(rows),
         "time_range": (min(r[time_col] for r in rows), max(r[time_col] for r in rows)),
@@ -145,11 +149,11 @@ def analyze_sample(body: bytes) -> dict:
 
 
 def extrapolate(sample: dict, raw_bytes: int, body_bytes: int) -> dict | None:
-    """推估查全臺北一天的資料量與點數（一次呼叫最多 7 天）。"""
-    interval = sample.get("median_interval_min")
-    if not interval:
+    """推估查全臺北一天的資料量與點數（假設抽樣日是完整一天；一次呼叫最多 7 天）。"""
+    per_station = sample.get("rows_per_station")
+    if not per_station:
         return None
-    rows_per_day = TAIPEI_STATIONS * (24 * 60 / interval)
+    rows_per_day = TAIPEI_STATIONS * per_station
     mb_body = rows_per_day * body_bytes / sample["rows"] / 1e6
     mb_raw = rows_per_day * raw_bytes / sample["rows"] / 1e6
     return {
