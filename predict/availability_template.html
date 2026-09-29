@@ -1,0 +1,223 @@
+<!doctype html>
+<html lang="zh-Hant">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>常用站無車機率</title>
+<style>
+:root {
+  color-scheme: light;
+  --page: #f9f9f7;
+  --surface-1: #fcfcfb;
+  --text-primary: #0b0b0b;
+  --text-secondary: #52514e;
+  --text-muted: #898781;
+  --grid: #e1e0d9;
+  --axis: #c3c2b7;
+  --border: rgba(11, 11, 11, 0.10);
+  --series-1: #2a78d6; /* 無車 */
+  --series-2: #eb6834; /* 無位 */
+}
+@media (prefers-color-scheme: dark) {
+  :root:not([data-theme="light"]) {
+    color-scheme: dark;
+    --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+    --text-muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+    --series-1: #3987e5; --series-2: #d95926;
+  }
+}
+:root[data-theme="dark"] {
+  color-scheme: dark;
+  --page: #0d0d0d; --surface-1: #1a1a19; --text-primary: #ffffff; --text-secondary: #c3c2b7;
+  --text-muted: #898781; --grid: #2c2c2a; --axis: #383835; --border: rgba(255, 255, 255, 0.10);
+  --series-1: #3987e5; --series-2: #d95926;
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--page); color: var(--text-primary);
+       font: 14px/1.5 system-ui, -apple-system, "Segoe UI", "PingFang TC", "Noto Sans TC", sans-serif; }
+main { max-width: 1100px; margin: 0 auto; padding: 24px 16px 48px; }
+h1 { font-size: 20px; font-weight: 600; margin: 0 0 4px; }
+h2 { font-size: 16px; font-weight: 600; margin: 0 0 12px; }
+.meta { color: var(--text-secondary); margin: 0 0 16px; }
+.legend { display: flex; gap: 20px; align-items: center; margin: 0 0 20px; color: var(--text-secondary); flex-wrap: wrap; }
+.key { display: inline-flex; align-items: center; gap: 8px; }
+.key i { display: inline-block; width: 16px; height: 2px; border-radius: 1px; }
+.station { background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px; padding: 16px; margin: 0 0 16px; }
+.panels { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+@media (max-width: 720px) { .panels { grid-template-columns: 1fr; } }
+.panel h3 { font-size: 13px; font-weight: 600; color: var(--text-secondary); margin: 0 0 4px; }
+.plot { position: relative; }
+svg { display: block; width: 100%; height: auto; overflow: visible; }
+.tick { fill: var(--text-muted); font-size: 11px; font-variant-numeric: tabular-nums; }
+.empty { fill: var(--text-muted); font-size: 13px; }
+.tip { position: absolute; pointer-events: none; background: var(--surface-1); border: 1px solid var(--border);
+       border-radius: 6px; padding: 8px 10px; font-size: 12px; box-shadow: 0 2px 8px rgba(0,0,0,.12);
+       white-space: nowrap; display: none; z-index: 2; }
+.tip .t { color: var(--text-secondary); margin-bottom: 4px; }
+.tip .row { display: flex; align-items: center; gap: 8px; }
+.tip .row i { width: 12px; height: 2px; border-radius: 1px; display: inline-block; }
+.tip b { font-weight: 600; font-variant-numeric: tabular-nums; min-width: 40px; }
+.tip .n { color: var(--text-muted); margin-top: 4px; }
+details { margin-top: 12px; color: var(--text-secondary); }
+table { border-collapse: collapse; font-size: 12px; margin-top: 8px; font-variant-numeric: tabular-nums; }
+th, td { padding: 2px 10px; text-align: right; border-bottom: 1px solid var(--grid); }
+th:first-child, td:first-child { text-align: left; }
+.note { color: var(--text-muted); font-size: 12px; margin-top: 24px; }
+</style>
+</head>
+<body>
+<main>
+  <h1>常用站無車／無位機率</h1>
+  <p class="meta" id="meta"></p>
+  <div class="legend">
+    <span class="key"><i style="background:var(--series-1)"></i>無車（可借 0 台）</span>
+    <span class="key"><i style="background:var(--series-2)"></i>無位（可還 0 格）</span>
+    <span class="key" id="lowkey"></span>
+  </div>
+  <div id="stations"></div>
+  <p class="note">機率＝該 15 分鐘時段內，所有快照中遇到 0 台（或 0 格）的比例。已排除停用站點，以及資料時間落後超過 30 分鐘的快照。平日／假日依人事行政總處辦公日曆表。</p>
+</main>
+<script>
+const DATA = /*__DATA__*/null;
+const W = 520, H = 220, M = { l: 40, r: 12, t: 12, b: 26 };
+const PW = W - M.l - M.r, PH = H - M.t - M.b;
+const SLOTS = Array.from({ length: 96 }, (_, i) => `${String(Math.floor(i / 4)).padStart(2, "0")}:${String(i % 4 * 15).padStart(2, "0")}`);
+const SERIES = [
+  { key: "p_no_bike", label: "無車", color: "var(--series-1)" },
+  { key: "p_no_dock", label: "無位", color: "var(--series-2)" },
+];
+const NS = "http://www.w3.org/2000/svg";
+const x = i => M.l + (i + 0.5) / 96 * PW;
+const y = p => M.t + (1 - p) * PH;
+const pct = p => p == null ? "—" : `${Math.round(p * 100)}%`;
+
+function el(tag, attrs = {}, parent) {
+  const e = document.createElementNS(NS, tag);
+  for (const [k, v] of Object.entries(attrs)) e.setAttribute(k, v);
+  if (parent) parent.appendChild(e);
+  return e;
+}
+
+function renderPanel(container, rows, minDays) {
+  const bySlot = new Map(rows.map(r => [r.slot, r]));
+  const svg = el("svg", { viewBox: `0 0 ${W} ${H}`, role: "img" });
+  for (const p of [0, 0.25, 0.5, 0.75, 1]) {
+    el("line", { x1: M.l, x2: W - M.r, y1: y(p), y2: y(p), stroke: p === 0 ? "var(--axis)" : "var(--grid)", "stroke-width": 1 }, svg);
+    el("text", { x: M.l - 6, y: y(p) + 4, "text-anchor": "end", class: "tick" }, svg).textContent = `${p * 100}%`;
+  }
+  for (let h = 0; h <= 24; h += 3) {
+    el("text", { x: M.l + h / 24 * PW, y: H - 6, "text-anchor": "middle", class: "tick" }, svg).textContent = `${h}:00`;
+  }
+  if (!rows.length) {
+    el("text", { x: M.l + PW / 2, y: M.t + PH / 2, "text-anchor": "middle", class: "empty" }, svg).textContent = "尚無資料";
+    container.appendChild(svg);
+    return;
+  }
+  for (const s of SERIES) {
+    // 相鄰兩個時段都有資料才連線；任一端樣本不足就淡化
+    for (let i = 0; i < 95; i++) {
+      const a = bySlot.get(SLOTS[i]), b = bySlot.get(SLOTS[i + 1]);
+      if (!a || !b) continue;
+      const low = a.n_days < minDays || b.n_days < minDays;
+      el("line", { x1: x(i), y1: y(a[s.key]), x2: x(i + 1), y2: y(b[s.key]), stroke: s.color, "stroke-width": 2,
+                   "stroke-linecap": "round", opacity: low ? 0.3 : 1 }, svg);
+    }
+    // 孤立的時段（前後都沒資料）畫成點，免得看不到
+    SLOTS.forEach((slot, i) => {
+      const r = bySlot.get(slot);
+      if (r && !bySlot.get(SLOTS[i - 1]) && !bySlot.get(SLOTS[i + 1])) {
+        el("circle", { cx: x(i), cy: y(r[s.key]), r: 4, fill: s.color, stroke: "var(--surface-1)", "stroke-width": 2,
+                       opacity: r.n_days < minDays ? 0.3 : 1 }, svg);
+      }
+    });
+  }
+  const cross = el("line", { y1: M.t, y2: M.t + PH, stroke: "var(--axis)", "stroke-width": 1, visibility: "hidden" }, svg);
+  const hit = el("rect", { x: M.l, y: M.t, width: PW, height: PH, fill: "transparent", tabindex: 0 }, svg);
+  const tip = document.createElement("div");
+  tip.className = "tip";
+  const show = i => {
+    const r = bySlot.get(SLOTS[i]);
+    cross.setAttribute("x1", x(i)); cross.setAttribute("x2", x(i)); cross.setAttribute("visibility", "visible");
+    tip.replaceChildren();
+    const t = document.createElement("div"); t.className = "t"; t.textContent = `${SLOTS[i]}–${SLOTS[i + 1] || "24:00"}`; tip.appendChild(t);
+    for (const s of SERIES) {
+      const row = document.createElement("div"); row.className = "row";
+      const k = document.createElement("i"); k.style.background = s.color;
+      const v = document.createElement("b"); v.textContent = pct(r ? r[s.key] : null);
+      const l = document.createElement("span"); l.textContent = s.label;
+      row.append(k, v, l); tip.appendChild(row);
+    }
+    const n = document.createElement("div"); n.className = "n";
+    n.textContent = r ? `樣本 ${r.n_days} 天、${r.n_snapshots} 筆快照${r.n_days < minDays ? "（不足）" : ""}` : "這個時段沒有資料";
+    tip.appendChild(n);
+    tip.style.display = "block";
+    const box = container.getBoundingClientRect(), scale = box.width / W;
+    const left = x(i) * scale;
+    tip.style.left = `${left + 12 + 160 > box.width ? left - 172 : left + 12}px`;
+    tip.style.top = `${M.t * scale}px`;
+  };
+  const hide = () => { cross.setAttribute("visibility", "hidden"); tip.style.display = "none"; };
+  let cur = 48;
+  hit.addEventListener("pointermove", e => {
+    const b = svg.getBoundingClientRect();
+    const px = (e.clientX - b.left) / b.width * W;
+    cur = Math.max(0, Math.min(95, Math.floor((px - M.l) / PW * 96)));
+    show(cur);
+  });
+  hit.addEventListener("pointerleave", hide);
+  hit.addEventListener("focus", () => show(cur));
+  hit.addEventListener("blur", hide);
+  hit.addEventListener("keydown", e => {
+    if (e.key === "ArrowRight") { cur = Math.min(95, cur + 1); show(cur); e.preventDefault(); }
+    if (e.key === "ArrowLeft") { cur = Math.max(0, cur - 1); show(cur); e.preventDefault(); }
+  });
+  container.append(svg, tip);
+}
+
+function renderTable(parent, rows) {
+  const d = document.createElement("details");
+  const s = document.createElement("summary"); s.textContent = "表格檢視"; d.appendChild(s);
+  const t = document.createElement("table");
+  const head = t.createTHead().insertRow();
+  for (const h of ["日型", "時段", "無車", "無位", "樣本天數", "快照數"]) {
+    const th = document.createElement("th"); th.textContent = h; head.appendChild(th);
+  }
+  const body = t.createTBody();
+  for (const r of rows) {
+    const tr = body.insertRow();
+    for (const v of [r.day_type, r.slot, pct(r.p_no_bike), pct(r.p_no_dock), r.n_days, r.n_snapshots]) {
+      tr.insertCell().textContent = v;
+    }
+  }
+  d.appendChild(t);
+  parent.appendChild(d);
+}
+
+const m = DATA.meta;
+document.getElementById("meta").textContent =
+  `資料期間 ${m.period || "—"}；平日 ${m.days["平日"] || 0} 天、假日 ${m.days["假日"] || 0} 天；` +
+  `${m.snapshots} 筆快照（排除 ${m.excluded_stale_or_inactive} 筆）；產生於 ${m.generated}`;
+const lowkey = document.getElementById("lowkey");
+const lk = document.createElement("i"); lk.style.cssText = "background:var(--text-muted);opacity:.3";
+lowkey.append(lk, document.createTextNode(`淡色＝樣本少於 ${m.min_days} 天`));
+
+const root = document.getElementById("stations");
+for (const st of DATA.stations) {
+  const sec = document.createElement("section"); sec.className = "station";
+  const h = document.createElement("h2"); h.textContent = `${st.name}（${st.sno}）`; sec.appendChild(h);
+  const panels = document.createElement("div"); panels.className = "panels";
+  const mine = DATA.rows.filter(r => r.sno === st.sno);
+  for (const dt of ["平日", "假日"]) {
+    const p = document.createElement("div"); p.className = "panel";
+    const h3 = document.createElement("h3"); h3.textContent = dt; p.appendChild(h3);
+    const plot = document.createElement("div"); plot.className = "plot"; p.appendChild(plot);
+    panels.appendChild(p);
+    renderPanel(plot, mine.filter(r => r.day_type === dt), m.min_days);
+  }
+  sec.appendChild(panels);
+  renderTable(sec, mine);
+  root.appendChild(sec);
+}
+</script>
+</body>
+</html>

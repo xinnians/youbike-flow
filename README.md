@@ -18,9 +18,14 @@ flows/       租借紀錄流向分析（本機跑）
   build_trips.py   zip → raw/trips/<年月>.parquet（容錯：編碼、欄位名、時間格式）
   stations.py      站點參照表（臺北市＋新北市即時 API）與站名比對
   analyze.py       前 5 名去向／來源、每小時淨流量（平日／假日）
+predict/     常用站無車／無位機率（第 2 週）
+  availability.py           data 分支快照 → 每站 × 平日/假日 × 15 分鐘的機率 CSV 與圖表頁
+tdx/         TDX 歷史車位 API 小探測（有用量護欄）
+  probe.py
 data/        小型參考資料（進 git）
   calendar_115.csv       人事行政總處 115 年（2026）辦公日曆表
   station_aliases.csv    改名站點對照（附證據）
+  my_stations.csv        常用站清單（機率圖只算這些站）
 raw/, out/   下載檔與分析輸出（不進 git，可用指令重建）
 ```
 
@@ -108,8 +113,38 @@ python3 -m venv .venv && .venv/bin/pip install -r requirements.txt
 | TDX 歷史車位 | `/api/historical/v2/Historical/Bike/Availability/{City}?Dates=`，一次最多 7 天，最早 2021-06-01（依據第三方 R 套件 `ChiaJung-Yeh/NYCU_TDX` 的原始碼）；**粒度與最新可查日期未驗證，要先申請帳號** |
 | 新北即時 API | `data.ntpc.gov.tw` 資料集 `010e5b15-…`，1,610 站，用來補還到新北的站點座標 |
 
+## 常用站無車／無位機率
+
+```bash
+git clone --branch data --single-branch https://github.com/xinnians/youbike-flow.git ~/youbike-data   # 之後用 git -C ~/youbike-data pull 更新
+.venv/bin/python -m predict.availability --data-dir ~/youbike-data
+```
+
+- 常用站在 `data/my_stations.csv`：目前是 `瑞光路316巷`（500108171）、`大港墘公園(洲子街)`（500108153）
+- 輸出 `out/availability_15min.csv` 與 `out/availability.html`（每站平日／假日兩張圖，滑鼠移上去看數值與樣本數，樣本少於 3 天的時段淡色顯示）
+- `p_no_bike`／`p_no_dock`：該時段所有快照中遇到 0 台／0 格的比例；`*_any`：該時段任一次快照為 0 的天數比例（較保守）
+- 排除停用站（`act ≠ 1`）與資料時間落後超過 30 分鐘的快照
+- **不回補歷史資料**（2026-09-29 決定），只用收集器從 2026-09-29 起的資料，樣本要累積到約 10/20 才夠
+- 瑞光路316巷是上班目的地型的站：平日早上 8–9 點大量還入、傍晚 17–18 點大量借出，所以早上要看無位、傍晚要看無車
+
+## TDX（2026-09-29 查證）
+
+- **不會自動扣款**：基礎會員每月免費 3 點，點數用完後有 5% 緩衝，之後當月停用；要付費必須自己主動訂閱（[交通部收費要點](https://www.motc.gov.tw/ch/app/data/doc?id=14&module=news&detailNo=1107913081326931968&serno=44e2cc94-8a1b-4fc0-b70e-f07551a05e2a&type=s&preview=&aplistdn=)第五、六點）
+- 歷史服務計費：每 10 次 1 點、每 20MB 1 點，兩者合併；基礎會員每把金鑰每分鐘最多 5 次（[訂閱收費](https://tdx.transportdata.tw/pricing)）
+- 歷史車位 API（`/v2/Historical/Bike/Availability/{City}`）只有 `Dates`（一次最多 7 天）、`$top`、`$format`、`Meta` 參數，**不能篩選站點**，每次都回傳整個縣市的資料。資料從 2021-06 到昨天，每天早上 8 點更新
+- 所以免費額度大概只夠查一天的全市資料 `[推論]`，不適合拿來回補
+
+探測步驟（只呼叫 1 次，約扣 0.15 點）：
+
+```bash
+cp .env.example .env    # 填入 TDX_CLIENT_ID、TDX_CLIENT_SECRET；.env 不進 git
+.venv/bin/python -m tdx.probe
+```
+
+`tdx/probe.py` 會把每月估計點數記在 `.tdx_usage.json`（不進 git），估計會超過 2.5 點就拒絕執行；如果 `$top` 沒生效、回應超過 3MB，會直接中斷。實際扣點以 TDX【會員中心 > 資料服務 > 使用統計】為準。
+
 ## 待辦
 
-- [ ] 申請 TDX 帳號（Client Id／Secret），實測歷史車位的粒度與日期範圍，寫回補腳本
-- [ ] 推上 GitHub、啟用 Actions，3 天後跑 `collector.coverage`
-- [ ] 提供常用站清單（5–10 站）
+- [ ] 建立 `.env`，執行 `python -m tdx.probe`，確認資料時間間隔，並核對是按壓縮前還是壓縮後的大小扣點
+- [ ] 確認 GitHub Actions 排程有正常觸發；3 天後執行 `collector.coverage`
+- [ ] 約 10/20 樣本夠了之後，看 `out/availability.html`，進入第 3–4 週實際使用與記錄
